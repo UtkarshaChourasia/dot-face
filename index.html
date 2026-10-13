@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dot Face</title>
+<style>
+  html,body{margin:0;height:100%;background:#0d0d0f;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif;color:#eee}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;z-index:2}
+  #start h1{font-weight:500;font-size:clamp(28px,5vw,56px);margin:0;letter-spacing:-.02em}
+  #start p{margin:0;opacity:.6;max-width:440px;font-size:15px;line-height:1.5}
+  button{background:#f2efe9;color:#111;border:0;padding:12px 22px;border-radius:999px;font-size:15px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:wait}
+  #hud{position:fixed;left:16px;bottom:14px;font-size:12px;opacity:.45;z-index:2;display:none}
+  #msg{position:fixed;top:16px;left:0;right:0;text-align:center;font-size:13px;opacity:.55;z-index:2}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="msg"></div>
+<div id="start">
+  <h1>Dot Face</h1>
+  <p>Dots lock onto your face and trace its real shape: jaw, eyes, brows, nose and lips. Move, tilt or open your mouth and they follow. Video stays on your device.</p>
+  <button id="go">Turn on camera</button>
+</div>
+<div id="hud">C  colour   D  density   cursor pushes dots   needs internet once to load the face model</div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const msg = document.getElementById('msg'), hud = document.getElementById('hud');
+const start = document.getElementById('start'), goBtn = document.getElementById('go');
+const video = document.createElement('video'); video.playsInline = true; video.muted = true;
+
+const palettes = [['#f2efe9','#0d0d0f'],['#ff5a3c','#0d0d0f'],['#7cf5c8','#07110e'],['#111111','#f2efe9'],['#c9b6ff','#0f0b1a']];
+let pal = 0, density = 1;
+let W, H, dpr;
+const mouse = { x: -9999, y: -9999 };
+
+let landmarker = null, lm = null, lastVideoTime = -1;
+let slots = [], parts = [];
+
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+// Build the list of dot slots: each slot is a point on or between face landmarks
+function buildSlots() {
+  slots = [];
+  const edges = new Set();
+  const add = (a, b, t, strong) => slots.push({ a, b, t, strong });
+  for (let i = 0; i < 468; i++) add(i, i, 0, false);
+  for (const c of FaceLandmarker.FACE_LANDMARKS_TESSELATION) {
+    const a = Math.min(c.start, c.end), b = Math.max(c.start, c.end);
+    const key = a * 1000 + b;
+    if (edges.has(key)) continue; edges.add(key);
+    add(a, b, 0.5, false);
+    if (density > 1) { add(a, b, 0.25, false); add(a, b, 0.75, false); }
+  }
+  const contours = [
+    FaceLandmarker.FACE_LANDMARKS_FACE_OVAL, FaceLandmarker.FACE_LANDMARKS_LIPS,
+    FaceLandmarker.FACE_LANDMARKS_LEFT_EYE, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,
+    FaceLandmarker.FACE_LANDMARKS_LEFT_EYEBROW, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYEBROW,
+    FaceLandmarker.FACE_LANDMARKS_LEFT_IRIS, FaceLandmarker.FACE_LANDMARKS_RIGHT_IRIS
+  ];
+  for (const set of contours) for (const c of set) {
+    add(c.start, c.end, 0, true);
+    add(c.start, c.end, 0.33, true);
+    add(c.start, c.end, 0.66, true);
+  }
+  // particles
+  const old = parts; parts = [];
+  for (let i = 0; i < slots.length; i++) {
+    const p = old[i] || { x: Math.random() * W, y: Math.random() * H,
+      vx: 0, vy: 0, ix: Math.random() * W, iy: Math.random() * H, ph: Math.random() * 6.28, r: 0.8 };
+    parts.push(p);
+  }
+}
+
+// map normalised landmark to screen (mirrored, cover fit)
+function toScreen(p) {
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const s = Math.max(W / vw, H / vh) * 1.0;
+  const dw = vw * s, dh = vh * s;
+  const x = (1 - p.x) * dw + (W - dw) / 2;
+  const y = p.y * dh + (H - dh) / 2;
+  return [x, y];
+}
+
+function frame(t) {
+  const [fg, back] = palettes[pal];
+  ctx.fillStyle = back; ctx.fillRect(0, 0, W, H);
+
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    lm = res.faceLandmarks && res.faceLandmarks.length ? res.faceLandmarks[0] : null;
+  }
+
+  let pts = null;
+  if (lm) pts = lm.map(toScreen);
+  msg.textContent = landmarker ? (lm ? '' : 'Looking for a face...') : '';
+
+  ctx.fillStyle = fg;
+  const tt = t * 0.001;
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i], s = slots[i];
+    let tx, ty, tr;
+    if (pts) {
+      const A = pts[s.a], B = pts[s.b];
+      tx = A[0] + (B[0] - A[0]) * s.t;
+      ty = A[1] + (B[1] - A[1]) * s.t;
+      const z = lm[s.a].z; // negative = closer to camera
+      tr = (s.strong ? 1.9 : 1.1) * (1 - z * 3);
+      tr = Math.max(0.6, Math.min(3.2, tr));
+      p.vx += (tx - p.x) * 0.16; p.vy += (ty - p.y) * 0.16;
+    } else {
+      // idle drift
+      tx = p.ix + Math.sin(tt * 0.6 + p.ph) * 40;
+      ty = p.iy + Math.cos(tt * 0.5 + p.ph * 1.3) * 40;
+      tr = 1.2;
+      p.vx += (tx - p.x) * 0.02; p.vy += (ty - p.y) * 0.02;
+    }
+    const dx = p.x - mouse.x, dy = p.y - mouse.y, d2 = dx * dx + dy * dy;
+    if (d2 < 90 * 90) {
+      const m = Math.sqrt(d2) || 1, f = (1 - m / 90) * 3;
+      p.vx += dx / m * f; p.vy += dy / m * f;
+    }
+    p.vx *= 0.72; p.vy *= 0.72;
+    p.x += p.vx; p.y += p.vy;
+    p.r += (tr - p.r) * 0.2;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.283); ctx.fill();
+  }
+  requestAnimationFrame(frame);
+}
+
+async function init() {
+  goBtn.disabled = true; goBtn.textContent = 'Loading face model...';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 720 } }, audio: false });
+    video.srcObject = stream; await video.play();
+    const files = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const opts = (delegate) => ({
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate },
+      runningMode: "VIDEO", numFaces: 1
+    });
+    try { landmarker = await FaceLandmarker.createFromOptions(files, opts("GPU")); }
+    catch { landmarker = await FaceLandmarker.createFromOptions(files, opts("CPU")); }
+    start.style.display = 'none'; hud.style.display = 'block';
+  } catch (e) {
+    goBtn.disabled = false; goBtn.textContent = 'Try again';
+    msg.textContent = 'Could not start: allow camera access and check your internet connection. (' + (e.message || e) + ')';
+    console.error(e);
+  }
+}
+
+goBtn.onclick = init;
+addEventListener('resize', resize);
+addEventListener('pointermove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'c') pal = (pal + 1) % palettes.length;
+  if (k === 'd') { density = density === 1 ? 2 : 1; buildSlots(); }
+});
+
+resize(); buildSlots();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
