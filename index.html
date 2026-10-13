@@ -220,7 +220,8 @@ const NOSE_LINES = [[168, 6, 197, 195, 5, 4], [129, 98, 97, 2, 326, 327, 358]];
 const INNER_LIP = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95];
 const EYE_L = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398];
 const EYE_R = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246];
-function fillPoly(poly, val) {
+function fillPoly(poly, val, arr) {
+  arr = arr || mouthIn;
   if (val <= 0.001) return;
   let minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
   for (const p of poly) { if (p[0] < minX) minX = p[0]; if (p[0] > maxX) maxX = p[0]; if (p[1] < minY) minY = p[1]; if (p[1] > maxY) maxY = p[1]; }
@@ -232,17 +233,18 @@ function fillPoly(poly, val) {
         const xi = poly[a][0], yi = poly[a][1], xj = poly[b][0], yj = poly[b][1];
         if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
       }
-      if (inside) { const k = j * cols + i; if (val > mouthIn[k]) mouthIn[k] = val; }
+      if (inside) { const k = j * cols + i; if (val > arr[k]) arr[k] = val; }
     }
   }
 }
+const OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];
 const mid = (pts, a, b) => [(pts[a][0] + pts[b][0]) / 2, (pts[a][1] + pts[b][1]) / 2];
 
 // face geometry in cell units, filled by computeFace
 const fg = { cx: 0, cy: 0, h: 1, chinRow: 0, ok: false };
 
 function computeFace(offx, offy) {
-  ff.fill(0); eg.fill(0); mouthIn.fill(0);
+  ff.fill(0); eg.fill(0); mouthIn.fill(0); ffH2.fill(0);
   fg.ok = false;
   if (!lm) return false;
   const pts = lm.map((p) => [(p[0] - offx) / S, (p[1] - offy) / S]);
@@ -254,21 +256,24 @@ function computeFace(offx, offy) {
 
   // thin crisp outlines, a little stronger when that feature is active
   const gain = {
-    mouth: 0.55 + 1.0 * act.mouth + 0.7 * en.mouth, eyeL: 0.6 + 0.9 * act.eyeL + 0.7 * en.eyeL, eyeR: 0.6 + 0.9 * act.eyeR + 0.7 * en.eyeR,
-    browL: 0.55 + 1.0 * act.browL + 0.7 * en.browL, browR: 0.55 + 1.0 * act.browR + 0.7 * en.browR
+    mouth: 1.0 + 0.7 * act.mouth + 0.5 * en.mouth, eyeL: 1.0 + 0.6 * act.eyeL + 0.5 * en.eyeL, eyeR: 1.0 + 0.6 * act.eyeR + 0.5 * en.eyeR,
+    browL: 0.95 + 0.7 * act.browL + 0.5 * en.browL, browR: 0.95 + 0.7 * act.browR + 0.5 * en.browR
   };
   for (const [name, set] of SETS) {
     const brow = name === 'browL' || name === 'browR';
     for (const c of set) {
       const ax = pts[c.start][0], ay = pts[c.start][1], cx2 = pts[c.end][0], cy2 = pts[c.end][1];
       splatLine(ax, ay, cx2, cy2, gain[name] * expr);
-      if (brow) { splatLine(ax, ay - 0.9, cx2, cy2 - 0.9, gain[name] * 0.6 * expr); splatLine(ax, ay + 0.9, cx2, cy2 + 0.9, gain[name] * 0.6 * expr); }
+      if (brow) { splatLine(ax, ay + 0.5, cx2, cy2 + 0.5, gain[name] * 0.5 * expr); }
     }
   }
-  for (const line of NOSE_LINES) for (let i = 0; i < line.length - 1; i++) splatLine(pts[line[i]][0], pts[line[i]][1], pts[line[i + 1]][0], pts[line[i + 1]][1], 0.35 * expr);
+  for (const line of NOSE_LINES) for (let i = 0; i < line.length - 1; i++) splatLine(pts[line[i]][0], pts[line[i]][1], pts[line[i + 1]][0], pts[line[i + 1]][1], 0.7 * expr);
+
+  // face oval: a clean contour so the head shape reads
+  for (let i = 0; i < OVAL.length; i++) { const a = pts[OVAL[i]], b = pts[OVAL[(i + 1) % OVAL.length]]; splatLine(a[0], a[1], b[0], b[1], 0.8 * expr); }
 
   // nostrils and the base of the nose
-  for (const n of [98, 327, 2]) splatBlob(ff, pts[n][0], pts[n][1], 0.9, 0.45 * expr);
+  for (const n of [98, 327, 2]) splatBlob(ff, pts[n][0], pts[n][1], 0.9, 0.7 * expr);
 
   // a bright pupil dot in each open eye
   if (pts[468] && pts[473]) {
@@ -297,10 +302,9 @@ function computeFace(offx, offy) {
   splatBlob(eg, pts[105][0], pts[105][1], rr, en.browL);
   splatBlob(eg, pts[334][0], pts[334][1], rr, en.browR);
 
-  // soft glow: blur the feature map so brightness fades into the skin instead of ending at a hard line
-  boxBlur(ff, ffH, 2);
-  boxBlur(ffH, ffH2, 2);
-  for (let k = 0; k < N; k++) ff[k] = 0.8 * ff[k] + 2.2 * ffH2[k];
+  // face region: an even skin fill inside the oval, softened only at its edge
+  fillPoly(OVAL.map((i) => pts[i]), 1, ffH2);
+  boxBlur(ffH2, ffH, 1);
   return true;
 }
 
@@ -343,9 +347,10 @@ function computeField() {
         const dx = (i - fg.cx) / (fg.h * 0.6), dy = (j - fg.cy) / (fg.h * 0.7);
         faceG = Math.exp(-(dx * dx + dy * dy));
       }
-      let w = m * (0.4 + 0.35 * shade * Math.pow(t, 0.9) + 0.3 * detail * e + 0.1 * faceG);
+      const fb = hasFace ? ffH[k] : 0;
+      let w = m * (hasFace ? 0.12 + fb * (0.42 + 0.2 * shade * (t - 0.5) + 0.12 * detail * e) : 0.4 + 0.3 * t);
       if (hasFace) {
-        w = w * rowFade * (1 - mouthIn[k]) + m * Math.min(2.0, ff[k]);
+        w = w * rowFade * (1 - mouthIn[k]) + m * Math.min(1.6, ff[k]);
       }
       fs[k] += (w - fs[k]) * 0.6;
     }
@@ -389,7 +394,7 @@ function frame(t) {
       tx = offx + (c + oj[i]) * S + Math.sin(tt * 2.1 + ph[i]) * 0.35;
       ty = offy + (j + ok[i]) * S + Math.cos(tt * 1.8 + ph[i]) * 0.35;
       kk = stiff[i];
-      const wn = Math.min(1, fs[k] / 2.4);
+      const wn = Math.min(1, fs[k] / 1.8);
       r = 0.7 + 0.8 * Math.pow(wn, 1.1);
       bucket = wn < 0.22 ? 0 : wn < 0.45 ? 1 : wn < 0.7 ? 2 : 3;
       const kick = eg[k];
