@@ -25,7 +25,7 @@
   <button id="go">Turn on camera</button>
   <small>Video stays on your device</small>
 </div>
-<div id="hud">K counter   C palette   F fullscreen   I flip cutout   X expression strength   B shading   E detail   D dot count</div>
+<div id="hud">K counter   C palette   F fullscreen   I flip cutout   X expression strength   B shading   E detail   D dot count   V lit or shadow dots</div>
 
 <script type="module">
 import { ImageSegmenter, FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
@@ -38,9 +38,9 @@ const video = document.createElement('video'); video.playsInline = true; video.m
 
 const palettes = [['#f2efe9','#0a0a0d'],['#ff6a4a','#0a0a0d'],['#7cf5c8','#06100d'],['#c9b6ff','#0e0a18'],['#16130f','#efeae0']];
 let pal = 0, showCount = false, invert = false, autoChecked = 0;
-let shade = 1, detail = 1, expr = 1, densityIdx = 1;
-const densities = [0.16, 0.26, 0.4];
-const S = 5; // cell size in pixels for reading the image
+let shade = 1, detail = 1, expr = 1, densityIdx = 1, pol = 0;
+const densities = [0.25, 0.5, 0.9];
+const S = 4; // cell size in pixels for reading the image
 
 let W, H, dpr, cols, rows, N, P;
 let px, py, vx, vy, bx, by, ph, stiff, depth, u1, u2, oj, ok;
@@ -246,7 +246,7 @@ const fg = { cx: 0, cy: 0, h: 1, chinRow: 0, ok: false };
 function computeFace(offx, offy) {
   ff.fill(0); eg.fill(0); mouthIn.fill(0); ffH2.fill(0);
   fg.ok = false;
-  if (!lm) return false;
+  return false; // clean mode: no face overlay, dots follow the camera image only
   const pts = lm.map((p) => [(p[0] - offx) / S, (p[1] - offy) / S]);
   const top = pts[10], chin = pts[152];
   fg.cx = (top[0] + chin[0]) / 2; fg.cy = (top[1] + chin[1]) / 2;
@@ -338,7 +338,7 @@ function computeField() {
       const k = j * cols + i;
       let tg = (lumS[k] - lo) / span; tg = tg < 0 ? 0 : tg > 1 ? 1 : tg;
       // flatten uneven room light so a dim cheek still reads as skin
-      let tl = 0.5 + 1.2 * (lumS[k] - lumXL[k]) / span; tl = tl < 0 ? 0 : tl > 1 ? 1 : tl;
+      let tl = 0.5 + 1.8 * (lumS[k] - lumXL[k]) / span; tl = tl < 0 ? 0 : tl > 1 ? 1 : tl;
       const t = 0.5 * tg + 0.5 * tl;
       let e = Math.abs(lumS[k] - lumL[k]) / (span * 0.3); e = e > 1 ? 1 : e;
       const m = clamp01((maskB[k] - 0.3) / 0.4);
@@ -347,8 +347,10 @@ function computeField() {
         const dx = (i - fg.cx) / (fg.h * 0.6), dy = (j - fg.cy) / (fg.h * 0.7);
         faceG = Math.exp(-(dx * dx + dy * dy));
       }
-      const fb = hasFace ? ffH[k] : 0;
-      let w = m * (hasFace ? 0.12 + fb * (0.42 + 0.2 * shade * (t - 0.5) + 0.12 * detail * e) : 0.4 + 0.3 * t);
+      let c = (t - 0.5) * (1 + 0.8 * shade) + 0.5; c = c < 0 ? 0 : c > 1 ? 1 : c;
+      const d = pol ? 1 - c : c;
+      const fl = pol ? 0.06 : 0.08;
+      let w = m * (fl + (1 - fl) * Math.pow(d, 1.4) + 0.3 * detail * e);
       if (hasFace) {
         w = w * rowFade * (1 - mouthIn[k]) + m * Math.min(1.6, ff[k]);
       }
@@ -394,9 +396,7 @@ function frame(t) {
       tx = offx + (c + oj[i]) * S + Math.sin(tt * 2.1 + ph[i]) * 0.35;
       ty = offy + (j + ok[i]) * S + Math.cos(tt * 1.8 + ph[i]) * 0.35;
       kk = stiff[i];
-      const wn = Math.min(1, fs[k] / 1.8);
-      r = 0.7 + 0.8 * Math.pow(wn, 1.1);
-      bucket = wn < 0.22 ? 0 : wn < 0.45 ? 1 : wn < 0.7 ? 2 : 3;
+      r = 0.85; bucket = 3;
       const kick = eg[k];
       if (kick > 0.03) { vx[i] += (Math.random() - 0.5) * kick * 3; vy[i] += (Math.random() - 0.5) * kick * 3; }
     } else {
@@ -468,6 +468,7 @@ addEventListener('keydown', e => {
   if (k === 'x') expr = expr >= 1.8 ? 0.4 : expr + 0.35;
   if (k === 'b') shade = shade >= 1.6 ? 0.4 : shade + 0.4;
   if (k === 'e') detail = detail >= 1.6 ? 0.2 : detail + 0.4;
+  if (k === 'v') { pol = 1 - pol; }
   if (k === 'd') { densityIdx = (densityIdx + 1) % densities.length; build(); }
   if (k === 'f') { if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen?.(); }
 });
