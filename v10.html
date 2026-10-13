@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Data Points</title>
+<style>
+  html,body{margin:0;height:100%;background:#0a0a0d;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif;color:#eee}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;text-align:center;z-index:2}
+  #start small{opacity:.45;font-size:12px;letter-spacing:.02em}
+  button{background:#f2efe9;color:#111;border:0;padding:12px 24px;border-radius:999px;font-size:15px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:wait}
+  #count{position:fixed;left:24px;top:20px;z-index:2;font:500 13px/1.3 ui-monospace,Menlo,Consolas,monospace;letter-spacing:.04em;opacity:.8;display:none;font-variant-numeric:tabular-nums}
+  #count b{display:block;font-size:26px;font-weight:500;letter-spacing:0}
+  #hud{position:fixed;left:16px;bottom:14px;font-size:12px;opacity:.4;z-index:2;display:none;transition:opacity 1.2s}
+  #msg{position:fixed;top:16px;left:0;right:0;text-align:center;font-size:13px;opacity:.55;z-index:2;padding:0 16px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="msg"></div>
+<div id="count"><b id="n">0</b>data points</div>
+<div id="start">
+  <button id="go">Turn on camera</button>
+  <small>Video stays on your device</small>
+</div>
+<div id="hud">K counter   C palette   F fullscreen   I flip cutout   X expression strength   B shading   E detail   D dot count</div>
+
+<script type="module">
+import { ImageSegmenter, FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const msg = document.getElementById('msg'), hud = document.getElementById('hud');
+const start = document.getElementById('start'), goBtn = document.getElementById('go');
+const countBox = document.getElementById('count'), countN = document.getElementById('n');
+const video = document.createElement('video'); video.playsInline = true; video.muted = true;
+
+const palettes = [['#f2efe9','#0a0a0d'],['#ff6a4a','#0a0a0d'],['#7cf5c8','#06100d'],['#c9b6ff','#0e0a18'],['#16130f','#efeae0']];
+let pal = 0, showCount = false, invert = false, autoChecked = 0;
+let shade = 1, detail = 1, expr = 1, densityIdx = 1;
+const densities = [0.16, 0.26, 0.4];
+const S = 5; // cell size in pixels for reading the image
+
+let W, H, dpr, cols, rows, N, P;
+let px, py, vx, vy, bx, by, ph, stiff, depth, u1, u2, oj, ok;
+let lumRaw, maskRaw, lumS, lumL, lumXL, maskB, fs, cellCum, rowTot, rowCdf, tmp, ff, ffH, ffH2;
+let sample, sctx, msample, mctx, maskCanvas, maskCtx;
+let segmenter = null, landmarker = null, lastVideoTime = -1, haveMask = false, frameNo = 0;
+let lm = null; // face landmarks in screen pixels
+let shapes = null;
+const act = { mouth: 0, jaw: 0, smile: 0, browL: 0, browR: 0, eyeL: 0, eyeR: 0 };
+const en = { mouth: 0, browL: 0, browR: 0, eyeL: 0, eyeR: 0 };
+const prevAct = { mouth: 0, browL: 0, browR: 0, eyeL: 0, eyeR: 0 };
+let eg, mouthIn;
+let lo = 40, hi = 220, presence = 0;
+const mouse = { x: -9999, y: -9999 };
+
+function build() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  cols = Math.ceil(W / S); rows = Math.ceil(H / S); N = cols * rows;
+  P = Math.round(N * densities[densityIdx]);
+  sample = document.createElement('canvas'); sample.width = cols; sample.height = rows;
+  sctx = sample.getContext('2d', { willReadFrequently: true });
+  msample = document.createElement('canvas'); msample.width = cols; msample.height = rows;
+  mctx = msample.getContext('2d', { willReadFrequently: true });
+  lumRaw = new Float32Array(N); maskRaw = new Float32Array(N); lumS = new Float32Array(N);
+  lumL = new Float32Array(N); lumXL = new Float32Array(N); maskB = new Float32Array(N); fs = new Float32Array(N);
+  ff = new Float32Array(N); ffH = new Float32Array(N); ffH2 = new Float32Array(N); eg = new Float32Array(N); mouthIn = new Float32Array(N);
+  cellCum = new Float32Array(N); rowTot = new Float32Array(rows); rowCdf = new Float32Array(rows); tmp = new Float32Array(N);
+  px = new Float32Array(P); py = new Float32Array(P); vx = new Float32Array(P); vy = new Float32Array(P);
+  bx = new Float32Array(P); by = new Float32Array(P); ph = new Float32Array(P); stiff = new Float32Array(P);
+  depth = new Float32Array(P); u1 = new Float32Array(P); u2 = new Float32Array(P);
+  oj = new Float32Array(P); ok = new Float32Array(P);
+  const order = Array.from({ length: P }, (_, i) => i);
+  for (let i = P - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [order[i], order[j]] = [order[j], order[i]]; }
+  for (let i = 0; i < P; i++) {
+    bx[i] = Math.random() * W; by[i] = Math.random() * H;
+    px[i] = bx[i]; py[i] = by[i];
+    ph[i] = Math.random() * 6.283;
+    stiff[i] = 0.07 + Math.random() * 0.12;
+    depth[i] = Math.random();
+    u1[i] = (order[i] + Math.random()) / P;
+    u2[i] = (i * 0.6180339887) % 1;
+    oj[i] = Math.random(); ok[i] = Math.random();
+  }
+}
+
+function drawCover(target, source, sw, sh, w, h) {
+  const s = Math.max(w / sw, h / sh), dw = sw * s, dh = sh * s;
+  target.save(); target.translate(w, 0); target.scale(-1, 1);
+  target.drawImage(source, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  target.restore();
+}
+
+function toScreen(p) {
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const s = Math.max(W / vw, H / vh), dw = vw * s, dh = vh * s;
+  return [(1 - p.x) * dw + (W - dw) / 2, p.y * dh + (H - dh) / 2];
+}
+
+function runModels() {
+  frameNo++;
+  if (video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  if (landmarker) {
+    try {
+      const r = landmarker.detectForVideo(video, performance.now());
+      lm = r.faceLandmarks && r.faceLandmarks.length ? r.faceLandmarks[0].map(toScreen) : null;
+      shapes = null;
+      if (lm && r.faceBlendshapes && r.faceBlendshapes.length) {
+        shapes = {};
+        for (const c of r.faceBlendshapes[0].categories) shapes[c.categoryName] = c.score;
+      }
+    } catch (e) { lm = null; shapes = null; }
+    updateExpression();
+  }
+  if (!segmenter || frameNo % 2) return;
+  segmenter.segmentForVideo(video, performance.now(), (res) => {
+    const masks = res.confidenceMasks;
+    if (!masks || !masks.length) return;
+    const m = masks[masks.length - 1];
+    const arr = m.getAsFloat32Array(), mw = m.width, mh = m.height;
+    if (!maskCanvas) { maskCanvas = document.createElement('canvas'); maskCanvas.width = mw; maskCanvas.height = mh; maskCtx = maskCanvas.getContext('2d'); }
+    if (autoChecked < 20) {
+      let c = 0, cn = 0, e = 0, en = 0;
+      for (let y = 0; y < mh; y++) for (let x = 0; x < mw; x++) {
+        const v = arr[y * mw + x];
+        if (x > mw * 0.35 && x < mw * 0.65 && y > mh * 0.3 && y < mh * 0.7) { c += v; cn++; }
+        else if (x < mw * 0.12 || x > mw * 0.88) { e += v; en++; }
+      }
+      if (cn && en && autoChecked === 0) invert = (e / en) > (c / cn);
+      autoChecked++;
+    }
+    const img = maskCtx.createImageData(mw, mh);
+    for (let k = 0; k < arr.length; k++) {
+      let v = invert ? 1 - arr[k] : arr[k];
+      v = Math.min(1, Math.max(0, (v - 0.3) / 0.45));
+      const b = v * 255, p = k * 4;
+      img.data[p] = b; img.data[p + 1] = b; img.data[p + 2] = b; img.data[p + 3] = 255;
+    }
+    maskCtx.putImageData(img, 0, 0);
+    haveMask = true;
+  });
+}
+
+function boxBlur(src, dst, r) {
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    let s = 0, c = 0;
+    for (let d = -r; d <= r; d++) { const x = i + d; if (x >= 0 && x < cols) { s += src[j * cols + x]; c++; } }
+    tmp[j * cols + i] = s / c;
+  }
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    let s = 0, c = 0;
+    for (let d = -r; d <= r; d++) { const y = j + d; if (y >= 0 && y < rows) { s += tmp[y * cols + i]; c++; } }
+    dst[j * cols + i] = s / c;
+  }
+}
+
+const clamp01 = (v) => v < 0 ? 0 : v > 1 ? 1 : v;
+const bsv = (n) => (shapes && shapes[n]) || 0;
+
+// Turns blendshape scores into smooth activity and a short burst of energy when a feature changes quickly.
+function updateExpression() {
+  const t = {
+    jaw: bsv('jawOpen'),
+    smile: (bsv('mouthSmileLeft') + bsv('mouthSmileRight')) * 0.5,
+    mouth: Math.max(bsv('jawOpen'), (bsv('mouthSmileLeft') + bsv('mouthSmileRight')) * 0.7, bsv('mouthPucker'), bsv('mouthFunnel'), bsv('mouthFrownLeft') * 0.6, bsv('mouthFrownRight') * 0.6),
+    browL: Math.max(bsv('browInnerUp'), bsv('browOuterUpLeft'), bsv('browDownLeft')),
+    browR: Math.max(bsv('browInnerUp'), bsv('browOuterUpRight'), bsv('browDownRight')),
+    eyeL: Math.max(bsv('eyeBlinkLeft'), bsv('eyeWideLeft'), bsv('eyeSquintLeft') * 0.8),
+    eyeR: Math.max(bsv('eyeBlinkRight'), bsv('eyeWideRight'), bsv('eyeSquintRight') * 0.8)
+  };
+  for (const k in act) act[k] += ((lm ? t[k] : 0) - act[k]) * 0.4;
+  for (const k in en) {
+    const d = Math.abs(act[k] - prevAct[k]);
+    prevAct[k] = act[k];
+    en[k] += (Math.min(1, d * 7) - en[k]) * 0.35;
+  }
+}
+
+// Soft bands of weight along the features. Dots stay organic; they gather where the expression is.
+function splatLine(x0, y0, x1, y1, wt) {
+  const dx = x1 - x0, dy = y1 - y0, len = Math.hypot(dx, dy);
+  const n = Math.max(1, Math.ceil(len / 0.35));
+  for (let s = 0; s <= n; s++) {
+    const x = x0 + dx * s / n, y = y0 + dy * s / n;
+    const cx = Math.floor(x), cy = Math.floor(y);
+    for (let oy = -2; oy <= 2; oy++) for (let ox = -2; ox <= 2; ox++) {
+      const ix = cx + ox, iy = cy + oy;
+      if (ix < 0 || iy < 0 || ix >= cols || iy >= rows) continue;
+      const ddx = ix + 0.5 - x, ddy = iy + 0.5 - y;
+      ff[iy * cols + ix] += wt * 0.2 * Math.exp(-(ddx * ddx + ddy * ddy) / 0.9);
+    }
+  }
+}
+
+function splatBlob(arr, x, y, rad, amt) {
+  const R = Math.ceil(rad * 2.2), s2 = rad * rad;
+  const cx = Math.floor(x), cy = Math.floor(y);
+  for (let oy = -R; oy <= R; oy++) for (let ox = -R; ox <= R; ox++) {
+    const ix = cx + ox, iy = cy + oy;
+    if (ix < 0 || iy < 0 || ix >= cols || iy >= rows) continue;
+    const ddx = ix + 0.5 - x, ddy = iy + 0.5 - y;
+    arr[iy * cols + ix] += amt * Math.exp(-(ddx * ddx + ddy * ddy) / s2);
+  }
+}
+
+const SETS = [
+  ['mouth', FaceLandmarker.FACE_LANDMARKS_LIPS],
+  ['eyeL', FaceLandmarker.FACE_LANDMARKS_LEFT_EYE],
+  ['eyeR', FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE],
+  ['browL', FaceLandmarker.FACE_LANDMARKS_LEFT_EYEBROW],
+  ['browR', FaceLandmarker.FACE_LANDMARKS_RIGHT_EYEBROW]
+];
+const NOSE_LINES = [[168, 6, 197, 195, 5, 4], [129, 98, 97, 2, 326, 327, 358]];
+const INNER_LIP = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95];
+const EYE_L = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398];
+const EYE_R = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246];
+function fillPoly(poly, val, arr) {
+  arr = arr || mouthIn;
+  if (val <= 0.001) return;
+  let minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+  for (const p of poly) { if (p[0] < minX) minX = p[0]; if (p[0] > maxX) maxX = p[0]; if (p[1] < minY) minY = p[1]; if (p[1] > maxY) maxY = p[1]; }
+  for (let j = Math.max(0, Math.floor(minY)); j <= Math.min(rows - 1, Math.ceil(maxY)); j++) {
+    for (let i = Math.max(0, Math.floor(minX)); i <= Math.min(cols - 1, Math.ceil(maxX)); i++) {
+      const x = i + 0.5, y = j + 0.5;
+      let inside = false;
+      for (let a = 0, b = poly.length - 1; a < poly.length; b = a++) {
+        const xi = poly[a][0], yi = poly[a][1], xj = poly[b][0], yj = poly[b][1];
+        if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+      }
+      if (inside) { const k = j * cols + i; if (val > arr[k]) arr[k] = val; }
+    }
+  }
+}
+const OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];
+const mid = (pts, a, b) => [(pts[a][0] + pts[b][0]) / 2, (pts[a][1] + pts[b][1]) / 2];
+
+// face geometry in cell units, filled by computeFace
+const fg = { cx: 0, cy: 0, h: 1, chinRow: 0, ok: false };
+
+function computeFace(offx, offy) {
+  ff.fill(0); eg.fill(0); mouthIn.fill(0); ffH2.fill(0);
+  fg.ok = false;
+  if (!lm) return false;
+  const pts = lm.map((p) => [(p[0] - offx) / S, (p[1] - offy) / S]);
+  const top = pts[10], chin = pts[152];
+  fg.cx = (top[0] + chin[0]) / 2; fg.cy = (top[1] + chin[1]) / 2;
+  fg.h = Math.max(6, Math.hypot(chin[0] - top[0], chin[1] - top[1]));
+  fg.chinRow = chin[1];
+  fg.ok = true;
+
+  // thin crisp outlines, a little stronger when that feature is active
+  const gain = {
+    mouth: 1.0 + 0.7 * act.mouth + 0.5 * en.mouth, eyeL: 1.0 + 0.6 * act.eyeL + 0.5 * en.eyeL, eyeR: 1.0 + 0.6 * act.eyeR + 0.5 * en.eyeR,
+    browL: 0.95 + 0.7 * act.browL + 0.5 * en.browL, browR: 0.95 + 0.7 * act.browR + 0.5 * en.browR
+  };
+  for (const [name, set] of SETS) {
+    const brow = name === 'browL' || name === 'browR';
+    for (const c of set) {
+      const ax = pts[c.start][0], ay = pts[c.start][1], cx2 = pts[c.end][0], cy2 = pts[c.end][1];
+      splatLine(ax, ay, cx2, cy2, gain[name] * expr);
+      if (brow) { splatLine(ax, ay + 0.5, cx2, cy2 + 0.5, gain[name] * 0.5 * expr); }
+    }
+  }
+  for (const line of NOSE_LINES) for (let i = 0; i < line.length - 1; i++) splatLine(pts[line[i]][0], pts[line[i]][1], pts[line[i + 1]][0], pts[line[i + 1]][1], 0.7 * expr);
+
+  // face oval: a clean contour so the head shape reads
+  for (let i = 0; i < OVAL.length; i++) { const a = pts[OVAL[i]], b = pts[OVAL[(i + 1) % OVAL.length]]; splatLine(a[0], a[1], b[0], b[1], 0.8 * expr); }
+
+  // nostrils and the base of the nose
+  for (const n of [98, 327, 2]) splatBlob(ff, pts[n][0], pts[n][1], 0.9, 0.7 * expr);
+
+  // a bright pupil dot in each open eye
+  if (pts[468] && pts[473]) {
+    splatBlob(ff, pts[473][0], pts[473][1], 1.1, 0.8 * expr * (1 - Math.min(1, act.eyeL * 1.3)));
+    splatBlob(ff, pts[468][0], pts[468][1], 1.1, 0.8 * expr * (1 - Math.min(1, act.eyeR * 1.3)));
+  }
+
+  // a smile warms the cheeks
+  if (act.smile > 0.08) {
+    const k = act.smile * 0.7 * expr, r = fg.h * 0.1;
+    splatBlob(ff, pts[205][0], pts[205][1], r, k);
+    splatBlob(ff, pts[425][0], pts[425][1], r, k);
+  }
+
+  // the eye openings dim, and an open mouth empties out
+  fillPoly(EYE_L.map((i) => pts[i]), 0.6);
+  fillPoly(EYE_R.map((i) => pts[i]), 0.6);
+  fillPoly(INNER_LIP.map((i) => pts[i]), 0.85 * clamp01(act.jaw * 2.2 - 0.1));
+
+  // energy bursts: dots near a feature that just moved get a short shimmer
+  const mc = mid(pts, 13, 14), el = mid(pts, 159, 145), er = mid(pts, 386, 374);
+  const rr = fg.h * 0.13;
+  splatBlob(eg, mc[0], mc[1], rr, en.mouth);
+  splatBlob(eg, el[0], el[1], rr * 0.8, en.eyeL);
+  splatBlob(eg, er[0], er[1], rr * 0.8, en.eyeR);
+  splatBlob(eg, pts[105][0], pts[105][1], rr, en.browL);
+  splatBlob(eg, pts[334][0], pts[334][1], rr, en.browR);
+
+  // face region: an even skin fill inside the oval, softened only at its edge
+  fillPoly(OVAL.map((i) => pts[i]), 1, ffH2);
+  boxBlur(ffH2, ffH, 1);
+  return true;
+}
+
+let total = 0;
+function computeField() {
+  if (video.readyState < 2 || !haveMask) { fs.fill(0); total = 0; rowCdf.fill(0); return; }
+  const offx = (W - cols * S) / 2, offy = (H - rows * S) / 2;
+  drawCover(sctx, video, video.videoWidth, video.videoHeight, cols, rows);
+  const d = sctx.getImageData(0, 0, cols, rows).data;
+  mctx.clearRect(0, 0, cols, rows);
+  drawCover(mctx, maskCanvas, maskCanvas.width, maskCanvas.height, cols, rows);
+  const md = mctx.getImageData(0, 0, cols, rows).data;
+  let mn = 255, mx = 0;
+  for (let k = 0, p = 0; k < N; k++, p += 4) {
+    lumRaw[k] = 0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2];
+    maskRaw[k] = md[p] / 255;
+    if (maskRaw[k] > 0.7) { if (lumRaw[k] < mn) mn = lumRaw[k]; if (lumRaw[k] > mx) mx = lumRaw[k]; }
+  }
+  if (mx > mn + 20) { lo += (mn - lo) * 0.05; hi += (mx - hi) * 0.05; }
+  boxBlur(lumRaw, lumS, 1);
+  boxBlur(lumRaw, lumL, 4);
+  boxBlur(maskRaw, maskB, 1);
+  const hasFace = computeFace(offx, offy);
+  const span = Math.max(40, hi - lo);
+  boxBlur(lumRaw, lumXL, 12);
+  for (let j = 0; j < rows; j++) {
+    // shoulders fade out gently below the chin so the face leads, with no hard border
+    let rowFade = 1;
+    if (hasFace) rowFade = 1 - 0.45 * clamp01((j - fg.chinRow) / (fg.h * 1.3));
+    for (let i = 0; i < cols; i++) {
+      const k = j * cols + i;
+      let tg = (lumS[k] - lo) / span; tg = tg < 0 ? 0 : tg > 1 ? 1 : tg;
+      // flatten uneven room light so a dim cheek still reads as skin
+      let tl = 0.5 + 1.2 * (lumS[k] - lumXL[k]) / span; tl = tl < 0 ? 0 : tl > 1 ? 1 : tl;
+      const t = 0.5 * tg + 0.5 * tl;
+      let e = Math.abs(lumS[k] - lumL[k]) / (span * 0.3); e = e > 1 ? 1 : e;
+      const m = clamp01((maskB[k] - 0.3) / 0.4);
+      let faceG = 0;
+      if (hasFace) {
+        const dx = (i - fg.cx) / (fg.h * 0.6), dy = (j - fg.cy) / (fg.h * 0.7);
+        faceG = Math.exp(-(dx * dx + dy * dy));
+      }
+      const fb = hasFace ? ffH[k] : 0;
+      let w = m * (hasFace ? 0.12 + fb * (0.42 + 0.2 * shade * (t - 0.5) + 0.12 * detail * e) : 0.4 + 0.3 * t);
+      if (hasFace) {
+        w = w * rowFade * (1 - mouthIn[k]) + m * Math.min(1.6, ff[k]);
+      }
+      fs[k] += (w - fs[k]) * 0.6;
+    }
+  }
+  total = 0;
+  for (let j = 0; j < rows; j++) {
+    let run = 0;
+    for (let i = 0; i < cols; i++) { run += fs[j * cols + i]; cellCum[j * cols + i] = run; }
+    rowTot[j] = run; total += run; rowCdf[j] = total;
+  }
+}
+
+function firstAtLeast(arr, from, to, v) {
+  let a = from, b = to - 1;
+  while (a < b) { const m = (a + b) >> 1; if (arr[m] >= v) b = m; else a = m + 1; }
+  return a;
+}
+
+function frame(t) {
+  const [fg, back] = palettes[pal];
+  const tt = t * 0.001;
+  ctx.fillStyle = back; ctx.fillRect(0, 0, W, H);
+  runModels();
+  computeField();
+
+  presence += ((total > 25 ? 1 : 0) - presence) * 0.08;
+  const present = presence > 0.5 && total > 25;
+  const offx = (W - cols * S) / 2, offy = (H - rows * S) / 2;
+  const paths = [new Path2D(), new Path2D(), new Path2D(), new Path2D()];
+  let assembled = 0;
+
+  for (let i = 0; i < P; i++) {
+    let tx, ty, kk, r, bucket;
+    if (present) {
+      const rr = Math.min(u1[i], 0.99999) * total;
+      const j = firstAtLeast(rowCdf, 0, rows, rr);
+      const base = j * cols;
+      const cr = Math.min(u2[i], 0.99999) * Math.max(rowTot[j], 1e-6);
+      const c = firstAtLeast(cellCum, base, base + cols, cr) - base;
+      const k = base + c;
+      tx = offx + (c + oj[i]) * S + Math.sin(tt * 2.1 + ph[i]) * 0.35;
+      ty = offy + (j + ok[i]) * S + Math.cos(tt * 1.8 + ph[i]) * 0.35;
+      kk = stiff[i];
+      const wn = Math.min(1, fs[k] / 1.8);
+      r = 0.7 + 0.8 * Math.pow(wn, 1.1);
+      bucket = wn < 0.22 ? 0 : wn < 0.45 ? 1 : wn < 0.7 ? 2 : 3;
+      const kick = eg[k];
+      if (kick > 0.03) { vx[i] += (Math.random() - 0.5) * kick * 3; vy[i] += (Math.random() - 0.5) * kick * 3; }
+    } else {
+      const dz = 0.4 + depth[i] * 0.6;
+      tx = bx[i] + Math.sin(tt * 0.3 * dz + ph[i]) * 60 * dz;
+      ty = by[i] + Math.cos(tt * 0.24 * dz + ph[i] * 1.7) * 60 * dz;
+      kk = 0.016;
+      r = 0.6 + depth[i] * 1.0;
+      bucket = depth[i] < 0.4 ? 0 : depth[i] < 0.75 ? 1 : depth[i] < 0.93 ? 2 : 3;
+    }
+    const dx = px[i] - mouse.x, dy = py[i] - mouse.y, dd = dx * dx + dy * dy;
+    if (dd < 110 * 110) { const m = Math.sqrt(dd) || 1, f = (1 - m / 110) * 2.2; vx[i] += dx / m * f; vy[i] += dy / m * f; }
+    const ex = tx - px[i], ey = ty - py[i];
+    if (present && ex * ex + ey * ey < 196) assembled++;
+    vx[i] += ex * kk; vy[i] += ey * kk;
+    vx[i] *= 0.8; vy[i] *= 0.8;
+    px[i] += vx[i]; py[i] += vy[i];
+    paths[bucket].moveTo(px[i] + r, py[i]); paths[bucket].arc(px[i], py[i], r, 0, 6.283);
+  }
+
+  ctx.fillStyle = fg;
+  const tw = present ? 1 : 0.92 + 0.08 * Math.sin(tt * 1.3);
+  ctx.globalAlpha = 0.3 * tw; ctx.fill(paths[0]);
+  ctx.globalAlpha = 0.5 * tw; ctx.fill(paths[1]);
+  ctx.globalAlpha = 0.7 * tw; ctx.fill(paths[2]);
+  ctx.globalAlpha = 0.9 * tw; ctx.fill(paths[3]);
+  ctx.globalAlpha = 1;
+
+  if (showCount) countN.textContent = Math.round(assembled / P * 1e6).toLocaleString('en-US');
+  requestAnimationFrame(frame);
+}
+
+async function init() {
+  goBtn.disabled = true; goBtn.textContent = 'Loading...';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 720 } }, audio: false });
+    video.srcObject = stream; await video.play();
+    const files = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const segOpts = (delegate) => ({
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite", delegate },
+      runningMode: "VIDEO", outputConfidenceMasks: true, outputCategoryMask: false
+    });
+    const faceOpts = (delegate) => ({
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate },
+      runningMode: "VIDEO", numFaces: 1, outputFaceBlendshapes: true
+    });
+    try { segmenter = await ImageSegmenter.createFromOptions(files, segOpts("GPU")); }
+    catch { segmenter = await ImageSegmenter.createFromOptions(files, segOpts("CPU")); }
+    try { landmarker = await FaceLandmarker.createFromOptions(files, faceOpts("GPU")); }
+    catch { try { landmarker = await FaceLandmarker.createFromOptions(files, faceOpts("CPU")); } catch (e) { console.error(e); } }
+    start.style.display = 'none';
+    hud.style.display = 'block';
+    setTimeout(() => { hud.style.opacity = 0; }, 7000);
+  } catch (e) {
+    goBtn.disabled = false; goBtn.textContent = 'Try again';
+    msg.textContent = 'Could not start: allow camera access and check your internet connection. (' + (e.message || e) + ')';
+    console.error(e);
+  }
+}
+
+goBtn.onclick = init;
+addEventListener('resize', build);
+addEventListener('pointermove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'c') pal = (pal + 1) % palettes.length;
+  if (k === 'k') { showCount = !showCount; countBox.style.display = showCount ? 'block' : 'none'; }
+  if (k === 'i') { invert = !invert; autoChecked = 99; }
+  if (k === 'x') expr = expr >= 1.8 ? 0.4 : expr + 0.35;
+  if (k === 'b') shade = shade >= 1.6 ? 0.4 : shade + 0.4;
+  if (k === 'e') detail = detail >= 1.6 ? 0.2 : detail + 0.4;
+  if (k === 'd') { densityIdx = (densityIdx + 1) % densities.length; build(); }
+  if (k === 'f') { if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen?.(); }
+});
+
+build();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
