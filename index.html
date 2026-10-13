@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Dot Face</title>
+<title>Dot Portrait</title>
 <style>
   html,body{margin:0;height:100%;background:#0d0d0f;overflow:hidden;font-family:"Helvetica Neue",Arial,sans-serif;color:#eee}
   canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
@@ -13,162 +13,206 @@
   button{background:#f2efe9;color:#111;border:0;padding:12px 22px;border-radius:999px;font-size:15px;cursor:pointer}
   button:disabled{opacity:.5;cursor:wait}
   #hud{position:fixed;left:16px;bottom:14px;font-size:12px;opacity:.45;z-index:2;display:none}
-  #msg{position:fixed;top:16px;left:0;right:0;text-align:center;font-size:13px;opacity:.55;z-index:2}
+  #msg{position:fixed;top:16px;left:0;right:0;text-align:center;font-size:13px;opacity:.55;z-index:2;padding:0 16px}
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <div id="msg"></div>
 <div id="start">
-  <h1>Dot Face</h1>
-  <p>Dots lock onto your face and trace its real shape: jaw, eyes, brows, nose and lips. Move, tilt or open your mouth and they follow. Video stays on your device.</p>
+  <h1>Dot Portrait</h1>
+  <p>Your live image rebuilt as dots: hair, nose, shoulders and clothes, with the room cut away. Move and the dots move with you. Video stays on your device.</p>
   <button id="go">Turn on camera</button>
 </div>
-<div id="hud">C  colour   D  density   cursor pushes dots   needs internet once to load the face model</div>
+<div id="hud">V  true colour   C  palette   S  dot size   I  flip cutout if it shows the room instead of you</div>
 
 <script type="module">
-import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+import { ImageSegmenter, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 const msg = document.getElementById('msg'), hud = document.getElementById('hud');
 const start = document.getElementById('start'), goBtn = document.getElementById('go');
 const video = document.createElement('video'); video.playsInline = true; video.muted = true;
 
-const palettes = [['#f2efe9','#0d0d0f'],['#ff5a3c','#0d0d0f'],['#7cf5c8','#07110e'],['#111111','#f2efe9'],['#c9b6ff','#0f0b1a']];
-let pal = 0, density = 1;
-let W, H, dpr;
+const palettes = [['#f2efe9','#0d0d0f'],['#ff5a3c','#0d0d0f'],['#7cf5c8','#07110e'],['#16130f','#f2efe9'],['#c9b6ff','#0f0b1a']];
+let pal = 0, trueColour = false, invert = false, autoChecked = 0;
+const spacings = [6, 8, 11, 15];
+let spIdx = 1;
+
+let W, H, dpr, cols, rows, spacing, dots = [];
+let sample, sctx, msample, mctx, maskCanvas, maskCtx;
+let lum, prevLum, maskV, cr, cg, cb;
+let segmenter = null, lastVideoTime = -1, haveMask = false;
+let lo = 40, hi = 220;
 const mouse = { x: -9999, y: -9999 };
 
-let landmarker = null, lm = null, lastVideoTime = -1;
-let slots = [], parts = [];
-
-function resize() {
+function build() {
   dpr = Math.min(devicePixelRatio || 1, 2);
   W = innerWidth; H = innerHeight;
   cv.width = W * dpr; cv.height = H * dpr;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-}
-
-// Build the list of dot slots: each slot is a point on or between face landmarks
-function buildSlots() {
-  slots = [];
-  const edges = new Set();
-  const add = (a, b, t, strong) => slots.push({ a, b, t, strong });
-  for (let i = 0; i < 468; i++) add(i, i, 0, false);
-  for (const c of FaceLandmarker.FACE_LANDMARKS_TESSELATION) {
-    const a = Math.min(c.start, c.end), b = Math.max(c.start, c.end);
-    const key = a * 1000 + b;
-    if (edges.has(key)) continue; edges.add(key);
-    add(a, b, 0.5, false);
-    if (density > 1) { add(a, b, 0.25, false); add(a, b, 0.75, false); }
-  }
-  const contours = [
-    FaceLandmarker.FACE_LANDMARKS_FACE_OVAL, FaceLandmarker.FACE_LANDMARKS_LIPS,
-    FaceLandmarker.FACE_LANDMARKS_LEFT_EYE, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE,
-    FaceLandmarker.FACE_LANDMARKS_LEFT_EYEBROW, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYEBROW,
-    FaceLandmarker.FACE_LANDMARKS_LEFT_IRIS, FaceLandmarker.FACE_LANDMARKS_RIGHT_IRIS
-  ];
-  for (const set of contours) for (const c of set) {
-    add(c.start, c.end, 0, true);
-    add(c.start, c.end, 0.33, true);
-    add(c.start, c.end, 0.66, true);
-  }
-  // particles
-  const old = parts; parts = [];
-  for (let i = 0; i < slots.length; i++) {
-    const p = old[i] || { x: Math.random() * W, y: Math.random() * H,
-      vx: 0, vy: 0, ix: Math.random() * W, iy: Math.random() * H, ph: Math.random() * 6.28, r: 0.8 };
-    parts.push(p);
+  spacing = spacings[spIdx];
+  cols = Math.ceil(W / spacing); rows = Math.ceil(H / spacing);
+  sample = document.createElement('canvas'); sample.width = cols; sample.height = rows;
+  sctx = sample.getContext('2d', { willReadFrequently: true });
+  msample = document.createElement('canvas'); msample.width = cols; msample.height = rows;
+  mctx = msample.getContext('2d', { willReadFrequently: true });
+  const n = cols * rows;
+  lum = new Float32Array(n); prevLum = new Float32Array(n); maskV = new Float32Array(n);
+  cr = new Uint8Array(n); cg = new Uint8Array(n); cb = new Uint8Array(n);
+  dots = [];
+  const offx = (W - cols * spacing) / 2 + spacing / 2, offy = (H - rows * spacing) / 2 + spacing / 2;
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
+    const hx = offx + i * spacing, hy = offy + j * spacing;
+    dots.push({ hx, hy, x: hx, y: hy, vx: 0, vy: 0, r: 0 });
   }
 }
 
-// map normalised landmark to screen (mirrored, cover fit)
-function toScreen(p) {
-  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
-  const s = Math.max(W / vw, H / vh) * 1.0;
-  const dw = vw * s, dh = vh * s;
-  const x = (1 - p.x) * dw + (W - dw) / 2;
-  const y = p.y * dh + (H - dh) / 2;
-  return [x, y];
+function drawCover(target, source, sw, sh, w, h) {
+  const s = Math.max(w / sw, h / sh), dw = sw * s, dh = sh * s;
+  target.save(); target.translate(w, 0); target.scale(-1, 1);
+  target.drawImage(source, (w - dw) / 2, (h - dh) / 2, dw, dh);
+  target.restore();
 }
 
-function frame(t) {
+function runSegmentation() {
+  if (!segmenter || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  segmenter.segmentForVideo(video, performance.now(), (res) => {
+    const masks = res.confidenceMasks;
+    if (!masks || !masks.length) return;
+    const m = masks[masks.length - 1];
+    const arr = m.getAsFloat32Array(), mw = m.width, mh = m.height;
+    if (!maskCanvas) { maskCanvas = document.createElement('canvas'); maskCanvas.width = mw; maskCanvas.height = mh; maskCtx = maskCanvas.getContext('2d'); }
+    const img = maskCtx.createImageData(mw, mh);
+    // work out once whether the model marks person or background
+    if (autoChecked < 20) {
+      let c = 0, cn = 0, e = 0, en = 0;
+      for (let y = 0; y < mh; y++) for (let x = 0; x < mw; x++) {
+        const v = arr[y * mw + x];
+        if (x > mw * 0.35 && x < mw * 0.65 && y > mh * 0.3 && y < mh * 0.7) { c += v; cn++; }
+        else if (x < mw * 0.12 || x > mw * 0.88) { e += v; en++; }
+      }
+      if (cn && en && autoChecked === 0) invert = (e / en) > (c / cn);
+      autoChecked++;
+    }
+    for (let k = 0; k < arr.length; k++) {
+      let v = invert ? 1 - arr[k] : arr[k];
+      v = Math.min(1, Math.max(0, (v - 0.35) / 0.4)); // sharpen the edge of the cutout
+      const b = v * 255, p = k * 4;
+      img.data[p] = b; img.data[p + 1] = b; img.data[p + 2] = b; img.data[p + 3] = 255;
+    }
+    maskCtx.putImageData(img, 0, 0);
+    haveMask = true;
+  });
+}
+
+function readFrame() {
+  if (video.readyState < 2) return false;
+  drawCover(sctx, video, video.videoWidth, video.videoHeight, cols, rows);
+  const d = sctx.getImageData(0, 0, cols, rows).data;
+  let mdata = null;
+  if (haveMask) {
+    mctx.clearRect(0, 0, cols, rows);
+    drawCover(mctx, maskCanvas, maskCanvas.width, maskCanvas.height, cols, rows);
+    mdata = mctx.getImageData(0, 0, cols, rows).data;
+  }
+  let mn = 255, mx = 0;
+  for (let k = 0, p = 0; k < lum.length; k++, p += 4) {
+    const l = 0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2];
+    lum[k] = lum[k] * 0.5 + l * 0.5;
+    cr[k] = d[p]; cg[k] = d[p + 1]; cb[k] = d[p + 2];
+    const m = mdata ? mdata[p] / 255 : 1;
+    maskV[k] = maskV[k] * 0.4 + m * 0.6;
+    if (maskV[k] > 0.6) { if (lum[k] < mn) mn = lum[k]; if (lum[k] > mx) mx = lum[k]; }
+  }
+  if (mx > mn + 20) { lo += (mn - lo) * 0.05; hi += (mx - hi) * 0.05; }
+  return true;
+}
+
+function frame() {
   const [fg, back] = palettes[pal];
   ctx.fillStyle = back; ctx.fillRect(0, 0, W, H);
+  runSegmentation();
+  const ok = readFrame();
+  const maxR = spacing * 0.58;
+  const span = Math.max(40, hi - lo);
+  const darkOnLight = pal === 3;
 
-  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
-    lastVideoTime = video.currentTime;
-    const res = landmarker.detectForVideo(video, performance.now());
-    lm = res.faceLandmarks && res.faceLandmarks.length ? res.faceLandmarks[0] : null;
-  }
+  if (!trueColour) ctx.fillStyle = fg;
+  if (!trueColour) ctx.beginPath();
 
-  let pts = null;
-  if (lm) pts = lm.map(toScreen);
-  msg.textContent = landmarker ? (lm ? '' : 'Looking for a face...') : '';
-
-  ctx.fillStyle = fg;
-  const tt = t * 0.001;
-  for (let i = 0; i < parts.length; i++) {
-    const p = parts[i], s = slots[i];
-    let tx, ty, tr;
-    if (pts) {
-      const A = pts[s.a], B = pts[s.b];
-      tx = A[0] + (B[0] - A[0]) * s.t;
-      ty = A[1] + (B[1] - A[1]) * s.t;
-      const z = lm[s.a].z; // negative = closer to camera
-      tr = (s.strong ? 1.9 : 1.1) * (1 - z * 3);
-      tr = Math.max(0.6, Math.min(3.2, tr));
-      p.vx += (tx - p.x) * 0.16; p.vy += (ty - p.y) * 0.16;
-    } else {
-      // idle drift
-      tx = p.ix + Math.sin(tt * 0.6 + p.ph) * 40;
-      ty = p.iy + Math.cos(tt * 0.5 + p.ph * 1.3) * 40;
-      tr = 1.2;
-      p.vx += (tx - p.x) * 0.02; p.vy += (ty - p.y) * 0.02;
+  for (let k = 0; k < dots.length; k++) {
+    const d = dots[k];
+    let target = 0;
+    if (ok && maskV[k] > 0.25) {
+      let t = (lum[k] - lo) / span;
+      t = Math.min(1, Math.max(0, t));
+      if (darkOnLight) t = 1 - t;
+      // dark hair and shadows keep small dots so the shape reads; highlights grow
+      target = maxR * (0.22 + 0.78 * Math.pow(t, 0.85)) * Math.min(1, maskV[k] * 1.4);
     }
-    const dx = p.x - mouse.x, dy = p.y - mouse.y, d2 = dx * dx + dy * dy;
-    if (d2 < 90 * 90) {
-      const m = Math.sqrt(d2) || 1, f = (1 - m / 90) * 3;
-      p.vx += dx / m * f; p.vy += dy / m * f;
+    const motion = Math.abs(lum[k] - prevLum[k]); prevLum[k] = lum[k];
+    if (motion > 8 && target > 0) {
+      const a = Math.random() * 6.283, f = Math.min(motion * 0.04, 1.6);
+      d.vx += Math.cos(a) * f; d.vy += Math.sin(a) * f;
     }
-    p.vx *= 0.72; p.vy *= 0.72;
-    p.x += p.vx; p.y += p.vy;
-    p.r += (tr - p.r) * 0.2;
-    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.283); ctx.fill();
+    const dx = d.x - mouse.x, dy = d.y - mouse.y, dd = dx * dx + dy * dy;
+    if (dd < 100 * 100) {
+      const m = Math.sqrt(dd) || 1, f = (1 - m / 100) * 2.4;
+      d.vx += dx / m * f; d.vy += dy / m * f;
+    }
+    d.vx += (d.hx - d.x) * 0.1; d.vy += (d.hy - d.y) * 0.1;
+    d.vx *= 0.8; d.vy *= 0.8;
+    d.x += d.vx; d.y += d.vy;
+    d.r += (target - d.r) * 0.4;
+
+    if (d.r > 0.3) {
+      if (trueColour) {
+        // lift colours a little so they read on a dark ground
+        ctx.fillStyle = 'rgb(' + Math.min(255, cr[k] * 1.15 + 18) + ',' + Math.min(255, cg[k] * 1.15 + 18) + ',' + Math.min(255, cb[k] * 1.15 + 18) + ')';
+        ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, 6.283); ctx.fill();
+      } else {
+        ctx.moveTo(d.x + d.r, d.y); ctx.arc(d.x, d.y, d.r, 0, 6.283);
+      }
+    }
   }
+  if (!trueColour) ctx.fill();
   requestAnimationFrame(frame);
 }
 
 async function init() {
-  goBtn.disabled = true; goBtn.textContent = 'Loading face model...';
+  goBtn.disabled = true; goBtn.textContent = 'Loading model...';
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 720 } }, audio: false });
     video.srcObject = stream; await video.play();
     const files = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
     const opts = (delegate) => ({
-      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate },
-      runningMode: "VIDEO", numFaces: 1
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite", delegate },
+      runningMode: "VIDEO", outputConfidenceMasks: true, outputCategoryMask: false
     });
-    try { landmarker = await FaceLandmarker.createFromOptions(files, opts("GPU")); }
-    catch { landmarker = await FaceLandmarker.createFromOptions(files, opts("CPU")); }
+    try { segmenter = await ImageSegmenter.createFromOptions(files, opts("GPU")); }
+    catch { segmenter = await ImageSegmenter.createFromOptions(files, opts("CPU")); }
     start.style.display = 'none'; hud.style.display = 'block';
   } catch (e) {
     goBtn.disabled = false; goBtn.textContent = 'Try again';
-    msg.textContent = 'Could not start: allow camera access and check your internet connection. (' + (e.message || e) + ')';
+    msg.textContent = 'Could not start: allow camera access and check your connection. (' + (e.message || e) + ')';
     console.error(e);
   }
 }
 
 goBtn.onclick = init;
-addEventListener('resize', resize);
+addEventListener('resize', build);
 addEventListener('pointermove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
 addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
+  if (k === 'v') trueColour = !trueColour;
   if (k === 'c') pal = (pal + 1) % palettes.length;
-  if (k === 'd') { density = density === 1 ? 2 : 1; buildSlots(); }
+  if (k === 's') { spIdx = (spIdx + 1) % spacings.length; build(); }
+  if (k === 'i') { invert = !invert; autoChecked = 99; }
 });
 
-resize(); buildSlots();
+build();
 requestAnimationFrame(frame);
 </script>
 </body>
